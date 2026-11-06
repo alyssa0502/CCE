@@ -1,0 +1,91 @@
+# video-matting 已验证工作负载基准(2026-11-03/04 实测通过的组合)
+# 复刻模式直接 kubectl apply 本文件;占位符只有两处:<SWR_IMAGE> 与 <OSS_API_DOMAIN_VALUE>
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: video-matting
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: video-matting
+  # 单卡节点滚动必须先删旧再拉新,否则新 Pod 卡 ContainerCreating 抢不到 GPU
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: video-matting
+    spec:
+      containers:
+      - name: server
+        image: <SWR_IMAGE>          # 如 swr.cn-east-3.myhuaweicloud.com/mcn-poc/video-matting:20261103
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8001
+        env:
+        - name: SERVICE_NAME
+          value: video-matting-cce
+        - name: PORT
+          value: "8001"
+        - name: GPU_CONCURRENCY_LIMIT
+          value: "1"                # L2 24G 显存,串行是硬约束
+        - name: SAM2_COMPILE
+          value: "false"
+        - name: OSS_API_DOMAIN      # 数据隔离铁律:必须钉死垫片地址,绝不留代码默认值(=客户生产域名)
+          value: "<OSS_API_DOMAIN_VALUE>"   # 如 http://192.168.0.233:8001(节点上跑 assets/obs_shim.py)
+        # 长视频场景追加(显存不随帧数涨,代价是变慢):
+        # - name: SAM2_OFFLOAD_VIDEO_TO_CPU
+        #   value: "true"
+        readinessProbe:
+          httpGet: {path: /health, port: 8001}
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 60
+        livenessProbe:
+          httpGet: {path: /health, port: 8001}
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          failureThreshold: 5
+        resources:
+          limits:   {nvidia.com/gpu: 1, cpu: "12", memory: 16Gi}
+          requests: {nvidia.com/gpu: 1, cpu: "4", memory: 8Gi}
+        # ── 双卡模式(2026-11-04 实测定论,doc: cce_10_0345 GPU 整卡调度) ─────────
+        # 正整数 = 整卡独占;requests 若填必须与 limits 相等。改双卡需同时满足:
+        #   1) 必须有单节点 ≥2 张卡(2026-11-04 实测:两台单卡节点 .233/.71 改 gpu:2
+        #      → 调度器直接 Pending "Insufficient nvidia.com/gpu",autoscaler 拒绝扩容,
+        #      k8s 不跨节点拼卡;已回滚恢复)
+        #   2) image 必须用 <SWR_IMAGE> 全路径(本地 tag 只存在于导入它的节点)
+        #   3) nodeSelector 摘掉 hostname 钉死(若有)
+        #   limits:   {nvidia.com/gpu: 2, cpu: "12", memory: 16Gi}
+        #   requests: {nvidia.com/gpu: 2, cpu: "4", memory: 8Gi}
+        # 验证:kubectl exec <pod> -- nvidia-smi 应显示容器内可见 2 张卡。
+        # 注意:现镜像代码单进程只用 cuda:0,第二张卡可见但闲置(非 bug,代码层双卡需改造)。
+        volumeMounts:
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 32Gi}   # 帧缓冲(吃主机 RAM,节点须 ≥62G)
+      nodeSelector:
+        accelerator: nvidia-l2        # 实卡 NVIDIA L2 24GB(cc 8.9)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: video-matting-svc
+  namespace: default
+  annotations:
+    kubernetes.io/elb.class: "union"          # 共享型;独享用 performance
+    # eip_type 必填,CCE admission 缺了直接拒;注释绝不能写进块标量(会被折叠进 JSON)
+    kubernetes.io/elb.autocreate: '{"type":"public","bandwidth_name":"video-matting-bw","bandwidth_size":100,"bandwidth_sharetype":"PER","bandwidth_chargemode":"traffic","eip_type":"5_bgp"}'
+spec:
+  type: LoadBalancer
+  selector:
+    app: video-matting
+  ports:
+  - {port: 8001, targetPort: 8001}
+# 拿到 ELB IP 后:python scripts/elb_acl.py --elb-ip <ELB_IP> --allow-ip <用户出口IP> 挂白名单
